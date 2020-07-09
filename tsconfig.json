@@ -16,5 +16,5 @@
 		"experimentalDecorators": true,
 		"downlevelIteration": true
 	},
-	"exclude": ["node_modules", "lib", "es"]
+	"exclude": ["node_modules", "lib", "es", "tests", "mock"]
 }
