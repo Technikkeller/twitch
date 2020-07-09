@@ -3,7 +3,7 @@ import Logger, { LoggerOptions, LogLevel } from '@d-fischer/logger';
 import { NonEnumerable, ResolvableValue } from '@d-fischer/shared-utils';
 import { Listener } from '@d-fischer/typed-event-emitter';
 import IRCClient, { MessageTypes } from 'ircv3';
-import TwitchClient, { CommercialLength, InvalidTokenError } from 'twitch';
+import TwitchClient, { CommercialLength, InvalidTokenError, InvalidTokenTypeError } from 'twitch';
 import TwitchCommandsCapability from './Capabilities/TwitchCommandsCapability';
 import ClearChat from './Capabilities/TwitchCommandsCapability/MessageTypes/ClearChat';
 import HostTarget from './Capabilities/TwitchCommandsCapability/MessageTypes/HostTarget';
@@ -20,6 +20,7 @@ import ChatCommunityPayForwardInfo from './UserNotices/ChatCommunityPayForwardIn
 import ChatCommunitySubInfo from './UserNotices/ChatCommunitySubInfo';
 import ChatPrimeCommunityGiftInfo from './UserNotices/ChatPrimeCommunityGiftInfo';
 import ChatRaidInfo from './UserNotices/ChatRaidInfo';
+import ChatRewardGiftInfo from './UserNotices/ChatRewardGiftInfo';
 import ChatRitualInfo from './UserNotices/ChatRitualInfo';
 import ChatStandardPayForwardInfo from './UserNotices/ChatStandardPayForwardInfo';
 import ChatSubInfo, {
@@ -67,6 +68,11 @@ export interface ChatClientOptions {
 	 * You should not disable this except for debugging purposes.
 	 */
 	ssl?: boolean;
+
+	/**
+	 * Custom hostname for connecting to chat.
+	 */
+	hostName?: string;
 
 	/**
 	 * Whether to use a WebSocket to connect to chat.
@@ -379,6 +385,19 @@ export default class ChatClient extends IRCClient {
 	) => Listener = this.registerEvent();
 
 	/**
+	 * Fires when a user gifts rewards during a special event.
+	 *
+	 * @eventListener
+	 * @param channel The channel where the rewards were gifted.
+	 * @param user The user that gifted the rewards.
+	 * @param rewardGiftInfo Additional information about the reward gift.
+	 * @param msg The raw message that was received.
+	 */
+	onRewardGift: (
+		handler: (channel: string, user: string, rewardGiftInfo: ChatRewardGiftInfo, msg: UserNotice) => void
+	) => Listener = this.registerEvent();
+
+	/**
 	 * Fires when a user upgrades their Prime subscription to a paid subscription in a channel.
 	 *
 	 * @eventListener
@@ -628,7 +647,8 @@ export default class ChatClient extends IRCClient {
 		/* eslint-disable no-restricted-syntax */
 		super({
 			connection: {
-				hostName: options.webSocket === false ? 'irc.chat.twitch.tv' : 'irc-ws.chat.twitch.tv',
+				hostName:
+					options.hostName ?? (options.webSocket === false ? 'irc.chat.twitch.tv' : 'irc-ws.chat.twitch.tv'),
 				secure: options.ssl !== false
 			},
 			credentials: {
@@ -643,6 +663,14 @@ export default class ChatClient extends IRCClient {
 			channels: options.channels
 		});
 		/* eslint-enable no-restricted-syntax */
+
+		if (twitchClient?.tokenType === 'app') {
+			throw new InvalidTokenTypeError(
+				'You can not connect to chat using an AuthProvider that supplies app access tokens.\n' +
+					'To get an anonymous, read-only connection, please use `ChatClient.anonymous()`.\n' +
+					'To get a read-write connection, please provide a user access token to your TwitchClient instance, for example using `TwitchClient.withCredentials()`.'
+			);
+		}
 
 		this._chatLogger = new Logger({
 			name: 'twitch-chat',
@@ -933,6 +961,18 @@ export default class ChatClient extends IRCClient {
 					this.emit(this.onSubExtend, channel, tags.get('login')!, extendInfo, userNotice);
 					break;
 				}
+				case 'rewardgift': {
+					const rewardGiftInfo: ChatRewardGiftInfo = {
+						domain: tags.get('msg-param-domain')!,
+						gifterId: tags.get('user-id')!,
+						gifterDisplayName: tags.get('display-name')!,
+						count: Number(tags.get('msg-param-selected-count')),
+						gifterGiftCount: Number(tags.get('msg-param-total-reward-count')),
+						triggerType: tags.get('msg-param-trigger-type')!
+					};
+					this.emit(this.onRewardGift, channel, tags.get('login')!, rewardGiftInfo, userNotice);
+					break;
+				}
 				default: {
 					this._chatLogger.warn(`Unrecognized usernotice ID: ${messageType}`);
 				}
@@ -1204,12 +1244,20 @@ export default class ChatClient extends IRCClient {
 					break;
 				}
 
+				case 'bad_timeout_mod': {
+					const match = message.match(/^You cannot timeout moderator (\w+) unless/);
+					if (match) {
+						this.emit(this._onTimeoutResult, channel, toUserName(match[1]), undefined, messageType);
+					}
+					break;
+				}
+
 				case 'bad_timeout_admin':
 				case 'bad_timeout_global_mod':
 				case 'bad_timeout_staff': {
 					const match = message.match(/^You cannot ban (?:\w+ )+?(\w+)\.$/);
 					if (match) {
-						this.emit(this._onTimeoutResult, channel, match[1].toLowerCase(), undefined, messageType);
+						this.emit(this._onTimeoutResult, channel, toUserName(match[1]), undefined, messageType);
 					}
 					break;
 				}
@@ -1320,7 +1368,7 @@ export default class ChatClient extends IRCClient {
 						this._authVerified = false;
 						this._authFailureMessage = message;
 						this.emit(this.onAuthenticationFailure, message);
-						this._connection!.disconnect(false);
+						this._connection!.disconnect();
 					}
 					break;
 				}
@@ -1727,10 +1775,10 @@ export default class ChatClient extends IRCClient {
 	 * @param channel The channel to enable slow mode in.
 	 * @param delay The time (in seconds) a user needs to wait between messages.
 	 */
-	async enableSlow(channel: string, delay: number) {
+	async enableSlow(channel: string, delay: number = 30) {
 		channel = toUserName(channel);
 		return new Promise<void>((resolve, reject) => {
-			const e = this._onSlowResult((_channel, error) => {
+			const e = this._onSlowResult((_channel, _delay, error) => {
 				if (toUserName(_channel) === channel) {
 					if (error) {
 						reject(error);
@@ -1740,7 +1788,7 @@ export default class ChatClient extends IRCClient {
 					this.removeListener(e);
 				}
 			});
-			this.say(channel, '/slow');
+			this.say(channel, `/slow ${delay}`);
 		});
 	}
 
@@ -1983,17 +2031,7 @@ export default class ChatClient extends IRCClient {
 	 * Disconnects from the chat server.
 	 */
 	async quit() {
-		return new Promise<void>(resolve => {
-			if (this._connection) {
-				const thatConnection = this._connection;
-				const handler = () => {
-					thatConnection.removeListener('disconnect', handler);
-					resolve();
-				};
-				thatConnection.addListener('disconnect', handler);
-				thatConnection.disconnect();
-			}
-		});
+		return this._connection?.disconnect();
 	}
 
 	/**

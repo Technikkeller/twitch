@@ -1,6 +1,6 @@
 {
   "name": "twitch-chat-client",
-  "version": "4.1.0-pre.8",
+  "version": "4.1.0-pre.13",
   "description": "Interact with the Twitch Messaging Interface (aka Twitch chat).",
   "keywords": [
     "twitch",
@@ -25,18 +25,20 @@
     "url": "https://github.com/d-fischer/twitch.git",
     "directory": "packages/twitch-chat-client"
   },
+  "homepage": "https://d-fischer.github.io/twitch",
   "author": "Daniel Fischer <daniel@d-fischer.dev>",
   "license": "MIT",
   "dependencies": {
+    "@d-fischer/cache-decorators": "^2.0.0",
     "@d-fischer/deprecate": "^2.0.1",
     "@d-fischer/logger": "^1.1.1",
-    "@d-fischer/shared-utils": "^2.0.0",
+    "@d-fischer/shared-utils": "^2.0.1",
     "@d-fischer/typed-event-emitter": "^3.0.0",
-    "ircv3": "^0.23.5",
-    "tslib": "^1.9.3"
+    "ircv3": "^0.24.1",
+    "tslib": "^2.0.0"
   },
   "devDependencies": {
-    "twitch": "^4.1.0-pre.8"
+    "twitch": "^4.1.0-pre.13"
   },
   "peerDependencies": {
     "twitch": "^4.0.0"

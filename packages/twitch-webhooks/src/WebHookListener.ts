@@ -1,9 +1,6 @@
 import Logger, { LoggerOptions } from '@d-fischer/logger';
-import { getPortPromise } from '@d-fischer/portfinder';
-import { v4 } from '@d-fischer/public-ip';
 import getRawBody from '@d-fischer/raw-body';
-import { Request, Response, Server } from 'httpanda';
-import * as https from 'https';
+import { Request, RequestHandler, Response, Server } from 'httpanda';
 import TwitchClient, {
 	extractUserId,
 	HelixBanEvent,
@@ -15,6 +12,9 @@ import TwitchClient, {
 	HelixUser,
 	UserIdResolvable
 } from 'twitch';
+import ConnectionAdapter from './Adapters/ConnectionAdapter';
+import LegacyAdapter, { WebHookListenerConfig } from './Adapters/LegacyAdapter';
+import ConnectCompatibleApp from './ConnectCompatibleApp';
 import BanEventSubscription from './Subscriptions/BanEventSubscription';
 import ExtensionTransactionSubscription from './Subscriptions/ExtensionTransactionSubscription';
 import FollowsFromUserSubscription from './Subscriptions/FollowsFromUserSubscription';
@@ -41,62 +41,9 @@ export interface WebHookListenerCertificateConfig {
 }
 
 /**
- * Configuration of a reverse proxy that the listener may be behind.
- */
-export interface WebHookListenerReverseProxyConfig {
-	/**
-	 * The port your reverse proxy is available under.
-	 */
-	port?: number;
-
-	/**
-	 * Whether your reverse proxy is available using SSL on the given port.
-	 */
-	ssl?: boolean;
-
-	/**
-	 * The path prefix your reverse proxy redirects to the listener.
-	 *
-	 * Please keep in mind that this prefix needs to be stripped from the URL in order for the listener to work properly.
-	 *
-	 * For example, if you make your reverse proxy redirect any requests to https://twitchapp.example.com/hooks to the listener, the proxy needs to transform the URL from `/hooks/:name` to `/:name`.
-	 */
-	pathPrefix?: string;
-}
-
-/**
  * The configuration of a WebHook listener.
  */
-export interface WebHookListenerConfig {
-	/**
-	 * The host name the server will be available under.
-	 *
-	 * This is not an URL, but a plain host name, so it shouldn't contain `http://` or `https://` or any slashes.
-	 *
-	 * If not given, your IPv4 address will be automatically determined using a web service.
-	 */
-	hostName?: string;
-
-	/**
-	 * The port the server should listen to, and unless `reverseProxy` configuration is given, also the port it's available under.
-	 *
-	 * If not given, a free port will be automatically determined.
-	 */
-	port?: number;
-
-	/**
-	 * The SSL keychain that should be used to make the server available using a secure connection.
-	 *
-	 * If this is not given and `config.reverseProxy.ssl` is not true, the server will only be available via HTTP.
-	 * This means it can **only listen to unauthenticated topics** (stream changes and follows).
-	 */
-	ssl?: WebHookListenerCertificateConfig;
-
-	/**
-	 * Configuration of a reverse proxy that the listener may be behind.
-	 */
-	reverseProxy?: WebHookListenerReverseProxyConfig;
-
+export interface WebHookConfig {
 	/**
 	 * Default validity of a WebHook, in seconds.
 	 *
@@ -112,59 +59,48 @@ export interface WebHookListenerConfig {
 	logger?: Partial<LoggerOptions>;
 }
 
-/** @private */
-interface WebHookListenerComputedConfig {
-	hostName: string;
-	port: number;
-	ssl?: WebHookListenerCertificateConfig;
-	reverseProxy: Required<WebHookListenerReverseProxyConfig>;
-	hookValidity?: number;
-	logger: LoggerOptions;
-}
-
 /**
  * A WebHook listener you can track changes in various channel and user data with.
  */
 export default class WebHookListener {
 	private _server?: Server;
 	private readonly _subscriptions = new Map<string, Subscription>();
+
+	/** @private */ readonly _twitchClient: TwitchClient;
+	private readonly _adapter: ConnectionAdapter;
 	private readonly _logger: Logger;
+
+	private readonly _hookValidity?: number;
 
 	/**
 	 * Creates a new WebHook listener.
+	 *
+	 * @deprecated Use the normal constructor instead.
 	 *
 	 * @param twitchClient The TwitchClient instance to use for user info and API requests.
 	 * @param config
 	 */
 	static async create(twitchClient: TwitchClient, config: WebHookListenerConfig = {}) {
-		const listenerPort = config.port || (await getPortPromise());
-		const reverseProxy = config.reverseProxy || {};
-		return new WebHookListener(
-			{
-				hostName: config.hostName || (await v4()),
-				port: listenerPort,
-				ssl: config.ssl,
-				reverseProxy: {
-					port: reverseProxy.port || listenerPort,
-					ssl: reverseProxy.ssl === undefined ? !!config.ssl : reverseProxy.ssl,
-					pathPrefix: reverseProxy.pathPrefix || ''
-				},
-				hookValidity: config.hookValidity,
-				logger: {
-					name: 'twitch-webhooks',
-					emoji: true,
-					...(config.logger ?? {})
-				}
-			},
-			twitchClient
-		);
+		const adapter = await LegacyAdapter.create(config);
+		return new WebHookListener(twitchClient, adapter, config);
 	}
 
-	private constructor(
-		private readonly _config: WebHookListenerComputedConfig,
-		/** @private */ public readonly _twitchClient: TwitchClient
-	) {
-		this._logger = new Logger(_config.logger);
+	/**
+	 * Creates a new WebHook listener.
+	 *
+	 * @param twitchClient The TwitchClient instance to use for user info and API requests.
+	 * @param adapter The connection adapter.
+	 * @param config
+	 */
+	constructor(twitchClient: TwitchClient, adapter: ConnectionAdapter, config: WebHookConfig = {}) {
+		this._twitchClient = twitchClient;
+		this._adapter = adapter;
+		this._hookValidity = config.hookValidity;
+		this._logger = new Logger({
+			name: 'twitch-webhooks',
+			emoji: true,
+			...(config.logger ?? {})
+		});
 	}
 
 	/**
@@ -174,13 +110,7 @@ export default class WebHookListener {
 		if (this._server) {
 			throw new Error('Trying to listen while already listening');
 		}
-		let server: https.Server | undefined;
-		if (this._config.ssl) {
-			server = https.createServer({
-				key: this._config.ssl.key,
-				cert: this._config.ssl.cert
-			});
-		}
+		const server = this._adapter.createHttpServer();
 		this._server = new Server({
 			server,
 			// eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -197,16 +127,10 @@ export default class WebHookListener {
 			});
 			next();
 		});
-		this._server.get('/:id', (req, res, next) => {
-			this._handleVerification(req, res);
-			next();
-		});
-		this._server.post('/:id', async (req, res, next) => {
-			await this._handleNotification(req, res);
-			next();
-		});
-		await this._server.listen(this._config.port);
-		this._logger.info(`Listening on port ${this._config.port}`);
+		this._server.all('/:id', this._createHandleRequest());
+		const listenerPort = await this._adapter.getListenerPort();
+		await this._server.listen(listenerPort);
+		this._logger.info(`Listening on port ${listenerPort}`);
 
 		await Promise.all([...this._subscriptions.values()].map(async sub => sub.start()));
 	}
@@ -226,6 +150,29 @@ export default class WebHookListener {
 	}
 
 	/**
+	 * Applies middleware that handles WebHooks to a connect-compatible app (like express).
+	 *
+	 * @param app The app the middleware should be applied to.
+	 */
+	applyMiddleware(app: ConnectCompatibleApp) {
+		let { pathPrefix } = this._adapter;
+		if (pathPrefix) {
+			pathPrefix = `/${pathPrefix.replace(/^\/|\/$/, '')}`;
+		}
+		const paramParser: RequestHandler = (req, res, next) => {
+			const [, id] = req.path.split('/');
+			req.param = req.params = { id };
+			next();
+		};
+		const requestHandler = this._createHandleRequest();
+		if (pathPrefix) {
+			app.use(pathPrefix, paramParser, requestHandler);
+		} else {
+			app.use(paramParser, requestHandler);
+		}
+	}
+
+	/**
 	 * Subscribes to events representing a user changing a public setting or their email address.
 	 *
 	 * @param user The user for which to get notifications about changing a setting.
@@ -241,7 +188,7 @@ export default class WebHookListener {
 		user: UserIdResolvable,
 		handler: (user: HelixUser) => void,
 		withEmail: boolean = false,
-		validityInSeconds = this._config.hookValidity
+		validityInSeconds = this._hookValidity
 	) {
 		const userId = extractUserId(user);
 
@@ -266,7 +213,7 @@ export default class WebHookListener {
 	async subscribeToFollowsToUser(
 		user: UserIdResolvable,
 		handler: (follow: HelixFollow) => void,
-		validityInSeconds = this._config.hookValidity
+		validityInSeconds = this._hookValidity
 	) {
 		const userId = extractUserId(user);
 
@@ -291,7 +238,7 @@ export default class WebHookListener {
 	async subscribeToFollowsFromUser(
 		user: UserIdResolvable,
 		handler: (follow: HelixFollow) => void,
-		validityInSeconds = this._config.hookValidity
+		validityInSeconds = this._hookValidity
 	) {
 		const userId = extractUserId(user);
 
@@ -316,7 +263,7 @@ export default class WebHookListener {
 	async subscribeToStreamChanges(
 		user: UserIdResolvable,
 		handler: (stream?: HelixStream) => void,
-		validityInSeconds = this._config.hookValidity
+		validityInSeconds = this._hookValidity
 	) {
 		const userId = extractUserId(user);
 
@@ -341,7 +288,7 @@ export default class WebHookListener {
 	async subscribeToSubscriptionEvents(
 		user: UserIdResolvable,
 		handler: (subscriptionEvent: HelixSubscriptionEvent) => void,
-		validityInSeconds = this._config.hookValidity
+		validityInSeconds = this._hookValidity
 	) {
 		const userId = extractUserId(user);
 
@@ -368,7 +315,7 @@ export default class WebHookListener {
 		broadcaster: UserIdResolvable,
 		handler: (banEvent: HelixBanEvent) => void,
 		user?: UserIdResolvable,
-		validityInSeconds = this._config.hookValidity
+		validityInSeconds = this._hookValidity
 	) {
 		const broadcasterId = extractUserId(broadcaster);
 		const userId = user ? extractUserId(user) : undefined;
@@ -396,7 +343,7 @@ export default class WebHookListener {
 		broadcaster: UserIdResolvable,
 		handler: (modEvent: HelixModeratorEvent) => void,
 		user?: UserIdResolvable,
-		validityInSeconds = this._config.hookValidity
+		validityInSeconds = this._hookValidity
 	) {
 		const broadcasterId = extractUserId(broadcaster);
 		const userId = user ? extractUserId(user) : undefined;
@@ -422,7 +369,7 @@ export default class WebHookListener {
 	async subscribeToExtensionTransactions(
 		extensionId: string,
 		handler: (transaction: HelixExtensionTransaction) => void,
-		validityInSeconds = this._config.hookValidity
+		validityInSeconds = this._hookValidity
 	) {
 		const subscription = new ExtensionTransactionSubscription(extensionId, handler, this, validityInSeconds);
 		await subscription.start();
@@ -432,19 +379,18 @@ export default class WebHookListener {
 	}
 
 	/** @private */
-	_buildHookUrl(id: string) {
-		const protocol = this._config.reverseProxy.ssl ? 'https' : 'http';
+	async _buildHookUrl(id: string) {
+		const protocol = this._adapter.connectUsingSsl ? 'https' : 'http';
 
-		let hostName = this._config.hostName;
-
-		if (this._config.reverseProxy.port !== (this._config.reverseProxy.ssl ? 443 : 80)) {
-			hostName += `:${this._config.reverseProxy.port}`;
-		}
+		const hostName = await this._adapter.getHostName();
+		const externalPort = await this._adapter.getExternalPort();
+		const protocolDefaultPort = this._adapter.connectUsingSsl ? 443 : 80;
+		const hostPortion = externalPort === protocolDefaultPort ? hostName : `${hostName}:${externalPort}`;
 
 		// trim slashes on both ends
-		const pathPrefix = this._config.reverseProxy.pathPrefix.replace(/^\/|\/$/, '');
+		const pathPrefix = this._adapter.pathPrefix?.replace(/^\/|\/$/, '');
 
-		return `${protocol}://${hostName}${pathPrefix ? '/' : ''}${pathPrefix}/${id}`;
+		return `${protocol}://${hostPortion}${pathPrefix ? '/' : ''}${pathPrefix ?? ''}/${id}`;
 	}
 
 	/** @private */
@@ -461,8 +407,19 @@ export default class WebHookListener {
 		this._subscriptions.delete(id);
 	}
 
+	private _createHandleRequest(): RequestHandler {
+		return async (req, res, next) => {
+			if (req.method === 'GET') {
+				this._handleVerification(req, res);
+			} else if (req.method === 'POST') {
+				await this._handleNotification(req, res);
+			}
+			next();
+		};
+	}
+
 	private _handleVerification(req: Request, res: Response) {
-		const { id } = req.params;
+		const { id } = req.param;
 		const subscription = this._subscriptions.get(id);
 		if (subscription) {
 			const hubMode = req.query?.['hub.mode'];
@@ -494,7 +451,7 @@ export default class WebHookListener {
 
 	private async _handleNotification(req: Request, res: Response) {
 		const body = await getRawBody(req, true);
-		const { id } = req.params;
+		const { id } = req.param;
 		const subscription = this._subscriptions.get(id);
 		if (subscription) {
 			res.writeHead(202);
